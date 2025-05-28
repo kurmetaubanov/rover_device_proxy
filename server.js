@@ -1,9 +1,11 @@
+require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const { Socket } = require('phoenix');
 const ReceiptPrinter = require('./devices/receipt-printer');
 const CardScanner = require('./devices/card-scanner');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -12,12 +14,106 @@ let ELIXIR_SERVER_URL = process.env.ELIXIR_SERVER_URL || 'http://localhost:4001'
 app.use(express.json());
 app.use(express.static('public'));
 
-let authToken = null;
+let authToken = process.env.AUTH_TOKEN || null;
 let socket = null;
 let channel = null;
-let deviceProxyId = null;
+let deviceProxyId = process.env.DEVICE_ID || null;
+let deviceName = process.env.DEVICE_NAME || null;
 let receiptPrinter = null;
 let cardScanner = null;
+
+// Function to update .env file
+function updateEnvFile(updates) {
+    try {
+        const envPath = path.join(__dirname, '.env');
+        let envContent = '';
+        
+        // Read existing .env if it exists
+        if (fs.existsSync(envPath)) {
+            envContent = fs.readFileSync(envPath, 'utf8');
+        }
+        
+        // Parse existing env vars
+        const envVars = {};
+        envContent.split('\n').forEach(line => {
+            const trimmed = line.trim();
+            if (trimmed && !trimmed.startsWith('#')) {
+                const [key, ...valueParts] = trimmed.split('=');
+                if (key) {
+                    envVars[key.trim()] = valueParts.join('=').trim();
+                }
+            }
+        });
+        
+        // Apply updates
+        Object.assign(envVars, updates);
+        
+        // Rebuild .env content
+        const newContent = [
+            '# Server Configuration',
+            `PORT=${envVars.PORT || '3001'}`,
+            `ELIXIR_SERVER_URL=${envVars.ELIXIR_SERVER_URL || 'http://localhost:4001'}`,
+            '',
+            '# Persistent Authentication (auto-populated after successful auth)',
+            `AUTH_TOKEN=${envVars.AUTH_TOKEN || ''}`,
+            `DEVICE_ID=${envVars.DEVICE_ID || ''}`,
+            `DEVICE_NAME=${envVars.DEVICE_NAME || ''}`,
+            `SERVER_HOST=${envVars.SERVER_HOST || ''}`,
+            ''
+        ].join('\n');
+        
+        fs.writeFileSync(envPath, newContent);
+        console.log('Updated .env file with authentication data');
+        
+        // Update process.env for current session
+        Object.assign(process.env, updates);
+        
+    } catch (error) {
+        console.error('Failed to update .env file:', error);
+    }
+}
+
+// Function to clear authentication from .env
+function clearAuthFromEnv() {
+    updateEnvFile({
+        AUTH_TOKEN: '',
+        DEVICE_ID: '',
+        DEVICE_NAME: '',
+        SERVER_HOST: ''
+    });
+}
+
+// Function to try auto-reconnect on startup
+async function tryAutoReconnect() {
+    if (authToken && deviceProxyId) {
+        console.log(`Found saved authentication for device: ${deviceName || deviceProxyId}`);
+        console.log('Attempting auto-reconnect...');
+        
+        try {
+            // Update server URL if saved
+            if (process.env.SERVER_HOST) {
+                ELIXIR_SERVER_URL = process.env.SERVER_HOST;
+            }
+            
+            await connectToPhoenixChannel();
+            console.log('Auto-reconnected successfully with saved credentials');
+            return true;
+        } catch (error) {
+            console.error('Auto-reconnect failed:', error.message);
+            console.log('Saved credentials may be invalid. Please re-authenticate.');
+            
+            // Clear invalid credentials
+            authToken = null;
+            deviceProxyId = null;
+            deviceName = null;
+            clearAuthFromEnv();
+            return false;
+        }
+    }
+    
+    console.log('No saved authentication found. Waiting for manual authentication...');
+    return false;
+}
 
 // Инициализация устройств
 async function initializeDevices() {
@@ -65,15 +161,23 @@ app.post('/authenticate', async (req, res) => {
         });
         
         if (response.data.success) {
-            // Сначала устанавливаем все переменные
+            // Store authentication data
             authToken = response.data.token;
             deviceProxyId = response.data.device_id;
+            deviceName = response.data.name;
             ELIXIR_SERVER_URL = httpServerUrl;
             
-            console.log(`Authentication successful. Device: ${response.data.name} (ID: ${deviceProxyId})`);
-            console.log(`Auth token: ${authToken}`);
+            console.log(`Authentication successful. Device: ${deviceName} (ID: ${deviceProxyId})`);
             
-            // Теперь подключаемся к Phoenix Channel
+            // Save to .env file
+            updateEnvFile({
+                AUTH_TOKEN: authToken,
+                DEVICE_ID: deviceProxyId,
+                DEVICE_NAME: deviceName,
+                SERVER_HOST: httpServerUrl
+            });
+            
+            // Connect to Phoenix Channel
             try {
                 await connectToPhoenixChannel();
                 
@@ -81,13 +185,16 @@ app.post('/authenticate', async (req, res) => {
                     success: true, 
                     message: 'Authenticated successfully',
                     device_id: deviceProxyId,
-                    device_name: response.data.name
+                    device_name: deviceName,
+                    auto_saved: true
                 });
             } catch (wsError) {
                 console.error('WebSocket connection failed:', wsError.message);
-                // Очищаем токены если подключение не удалось
+                // Clear auth data if connection fails
                 authToken = null;
                 deviceProxyId = null;
+                deviceName = null;
+                clearAuthFromEnv();
                 
                 res.status(500).json({
                     success: false,
@@ -118,12 +225,24 @@ app.post('/authenticate', async (req, res) => {
     }
 });
 
+// Get current authentication status
+app.get('/auth-status', (req, res) => {
+    res.json({
+        authenticated: !!authToken,
+        device_id: deviceProxyId,
+        device_name: deviceName,
+        server_host: process.env.SERVER_HOST || ELIXIR_SERVER_URL,
+        auto_connected: !!authToken && !!deviceProxyId
+    });
+});
+
 // Получение статуса устройств
 app.get('/status', async (req, res) => {
     const status = {
         authenticated: !!authToken,
         connected: socket ? socket.isConnected() : false,
         device_id: deviceProxyId,
+        device_name: deviceName,
         auth_token: authToken ? 'present' : 'missing',
         printer: {
             available: !!receiptPrinter,
@@ -135,7 +254,8 @@ app.get('/status', async (req, res) => {
             ready: cardScanner ? cardScanner.isReady() : false,
             status: cardScanner ? cardScanner.getStatus() : 'not_initialized'
         },
-        server_url: ELIXIR_SERVER_URL
+        server_url: ELIXIR_SERVER_URL,
+        auto_connected: process.env.AUTH_TOKEN ? true : false
     };
     
     res.json(status);
@@ -157,8 +277,12 @@ app.post('/disconnect', (req, res) => {
     
     authToken = null;
     deviceProxyId = null;
+    deviceName = null;
     
-    console.log('Disconnected from server');
+    // Clear from .env file
+    clearAuthFromEnv();
+    
+    console.log('Disconnected from server and cleared saved credentials');
     res.json({ success: true, message: 'Disconnected successfully' });
 });
 
@@ -387,6 +511,7 @@ function generateTestReceiptHtml() {
             <div class="line"></div>
             <div>Date: ${now.toLocaleDateString()}</div>
             <div>Time: ${now.toLocaleTimeString()}</div>
+            <div>Device: ${deviceName || 'Unknown'}</div>
             <div>Device ID: ${deviceProxyId || 'Unknown'}</div>
             <div class="line"></div>
             <div class="center">
@@ -427,11 +552,17 @@ process.on('SIGINT', () => {
 });
 
 // Запуск сервера
-initializeDevices().then(() => {
-    app.listen(PORT, () => {
+initializeDevices().then(async () => {
+    app.listen(PORT, async () => {
         console.log(`Device Proxy Server running on http://localhost:${PORT}`);
         console.log(`Will connect to Phoenix server at: ${ELIXIR_SERVER_URL}`);
-        console.log('Waiting for authentication...');
+        
+        // Try to auto-reconnect with saved credentials
+        const autoConnected = await tryAutoReconnect();
+        
+        if (!autoConnected) {
+            console.log('Waiting for manual authentication...');
+        }
     });
 }).catch(error => {
     console.error('Failed to start server:', error);

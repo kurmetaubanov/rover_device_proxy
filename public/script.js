@@ -1,6 +1,35 @@
 let isAuthenticated = false;
 let currentServerHost = 'http://localhost:4000';
 
+// Check for auto-authentication on page load
+async function checkAutoAuth() {
+    try {
+        const response = await fetch('/auth-status');
+        const data = await response.json();
+        
+        if (data.authenticated && data.auto_connected) {
+            console.log('Found existing authentication');
+            isAuthenticated = true;
+            currentServerHost = data.server_host;
+            
+            // Update UI
+            document.getElementById('server-host').value = currentServerHost;
+            document.getElementById('device-name').textContent = data.device_name || 'Unknown';
+            document.getElementById('device-id').textContent = data.device_id || 'Unknown';
+            
+            showDeviceSection();
+            refreshStatus();
+            updateConnectionStatus(true);
+            
+            // Show auto-connection message
+            document.getElementById('auth-status').innerHTML = 
+                '<span class="success">Auto-connected with saved credentials</span>';
+        }
+    } catch (error) {
+        console.log('No auto-authentication available');
+    }
+}
+
 async function authenticate() {
     const authCode = document.getElementById('auth-code').value;
     const serverHost = document.getElementById('server-host').value;
@@ -29,7 +58,11 @@ async function authenticate() {
         const result = await response.json();
         
         if (result.success) {
-            statusDiv.innerHTML = '<span class="success">Connected successfully!</span>';
+            const message = result.auto_saved ? 
+                'Connected successfully! Credentials saved for auto-reconnect.' : 
+                'Connected successfully!';
+            statusDiv.innerHTML = `<span class="success">${message}</span>`;
+            
             isAuthenticated = true;
             currentServerHost = serverHost;
             
@@ -145,9 +178,10 @@ async function disconnect() {
         showAuthSection();
         updateConnectionStatus(false);
         
-        // Clear auth code
+        // Clear auth code and show disconnection message
         document.getElementById('auth-code').value = '';
-        document.getElementById('auth-status').innerHTML = '';
+        document.getElementById('auth-status').innerHTML = 
+            '<span class="info">Disconnected and cleared saved credentials</span>';
         
     } catch (error) {
         console.error('Disconnect error:', error);
@@ -179,3 +213,6 @@ document.getElementById('server-host').addEventListener('keypress', function(e) 
         authenticate();
     }
 });
+
+// Check for auto-authentication when page loads
+document.addEventListener('DOMContentLoaded', checkAutoAuth);
