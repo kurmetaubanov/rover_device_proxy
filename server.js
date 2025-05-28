@@ -1,7 +1,11 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const { Socket } = require('phoenix');
+
+// Add WebSocket support for Phoenix client
+const WebSocket = require('ws');
+global.WebSocket = WebSocket;
+
 const ReceiptPrinter = require('./devices/receipt-printer');
 const CardScanner = require('./devices/card-scanner');
 const path = require('path');
@@ -21,6 +25,7 @@ let deviceProxyId = process.env.DEVICE_ID || null;
 let deviceName = process.env.DEVICE_NAME || null;
 let receiptPrinter = null;
 let cardScanner = null;
+let reconnectInterval = null;
 
 // Function to update .env file
 function updateEnvFile(updates) {
@@ -87,6 +92,63 @@ function clearAuthFromEnv() {
     });
 }
 
+// Function to retry WebSocket connection
+async function retryWebSocketConnection(maxRetries = 5, initialDelay = 2000) {
+    if (!authToken || !deviceProxyId) {
+        console.error('Cannot retry WebSocket: missing auth token or device ID');
+        return false;
+    }
+
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            const delay = initialDelay * Math.pow(1.5, i); // Exponential backoff
+            if (i > 0) {
+                console.log(`WebSocket retry attempt ${i + 1}/${maxRetries} in ${delay/1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                console.log(`WebSocket connection attempt ${i + 1}/${maxRetries}`);
+            }
+            
+            await connectToPhoenixChannel();
+            console.log('WebSocket connection established successfully');
+            return true;
+        } catch (error) {
+            console.error(`WebSocket attempt ${i + 1} failed:`, error.message);
+        }
+    }
+    
+    console.error('All WebSocket connection attempts failed');
+    // Start automatic reconnection every 30 seconds
+    startAutoReconnect();
+    return false;
+}
+
+// Function to start automatic reconnection
+function startAutoReconnect() {
+    if (reconnectInterval) {
+        clearInterval(reconnectInterval);
+    }
+    
+    console.log('Starting automatic WebSocket reconnection (every 30 seconds)');
+    reconnectInterval = setInterval(async () => {
+        if (authToken && deviceProxyId && (!socket || !socket.isConnected())) {
+            console.log('Attempting automatic WebSocket reconnection...');
+            try {
+                await connectToPhoenixChannel();
+                console.log('Automatic reconnection successful');
+                clearInterval(reconnectInterval);
+                reconnectInterval = null;
+            } catch (error) {
+                console.error('Automatic reconnection failed:', error.message);
+            }
+        } else if (socket && socket.isConnected()) {
+            console.log('WebSocket already connected, stopping auto-reconnect');
+            clearInterval(reconnectInterval);
+            reconnectInterval = null;
+        }
+    }, 30000);
+}
+
 // Function to try auto-reconnect on startup
 async function tryAutoReconnect() {
     if (authToken && deviceProxyId) {
@@ -99,9 +161,14 @@ async function tryAutoReconnect() {
                 ELIXIR_SERVER_URL = process.env.SERVER_HOST;
             }
             
-            await connectToPhoenixChannel();
-            console.log('Auto-reconnected successfully with saved credentials');
-            return true;
+            const success = await retryWebSocketConnection();
+            if (success) {
+                console.log('Auto-reconnected successfully with saved credentials');
+                return true;
+            } else {
+                console.warn('Auto-reconnect failed, but credentials are still valid');
+                return true; // Still return true because auth is valid
+            }
         } catch (error) {
             console.error('Auto-reconnect failed:', error.message);
             console.log('Saved credentials may be invalid. Please re-authenticate.');
@@ -172,8 +239,8 @@ app.post('/authenticate', async (req, res) => {
             ELIXIR_SERVER_URL = httpServerUrl;
             
             console.log(`Authentication successful. Device: ${deviceName} (ID: ${deviceProxyId})`);
-            
             console.log(authToken);
+            
             // Save to .env file
             updateEnvFile({
                 AUTH_TOKEN: authToken,
@@ -182,30 +249,18 @@ app.post('/authenticate', async (req, res) => {
                 SERVER_HOST: httpServerUrl
             });
             
-            // Connect to Phoenix Channel
-            try {
-                await connectToPhoenixChannel();
-                
-                res.json({ 
-                    success: true, 
-                    message: 'Authenticated successfully',
-                    device_id: deviceProxyId,
-                    device_name: deviceName,
-                    auto_saved: true
-                });
-            } catch (wsError) {
-                console.error('WebSocket connection failed:', wsError.message);
-                // Clear auth data if connection fails
-                authToken = null;
-                deviceProxyId = null;
-                deviceName = null;
-                clearAuthFromEnv();
-                
-                res.status(500).json({
-                    success: false,
-                    error: 'Authentication successful but WebSocket connection failed: ' + wsError.message
-                });
-            }
+            // Try to connect to Phoenix Channel with retry logic
+            const wsConnected = await retryWebSocketConnection();
+            
+            res.json({ 
+                success: true, 
+                message: 'Authenticated successfully',
+                device_id: deviceProxyId,
+                device_name: deviceName,
+                auto_saved: true,
+                websocket_connected: wsConnected,
+                warning: wsConnected ? null : 'WebSocket connection failed - will retry automatically'
+            });
         } else {
             console.log('Authentication failed: Invalid or expired code');
             res.status(401).json({ 
@@ -237,7 +292,8 @@ app.get('/auth-status', (req, res) => {
         device_id: deviceProxyId,
         device_name: deviceName,
         server_host: process.env.SERVER_HOST || ELIXIR_SERVER_URL,
-        auto_connected: !!authToken && !!deviceProxyId
+        auto_connected: !!authToken && !!deviceProxyId,
+        websocket_connected: socket ? socket.isConnected() : false
     });
 });
 
@@ -260,14 +316,44 @@ app.get('/status', async (req, res) => {
             status: cardScanner ? cardScanner.getStatus() : 'not_initialized'
         },
         server_url: ELIXIR_SERVER_URL,
-        auto_connected: process.env.AUTH_TOKEN ? true : false
+        auto_connected: process.env.AUTH_TOKEN ? true : false,
+        auto_reconnect_active: !!reconnectInterval
     };
     
     res.json(status);
 });
 
+// Manual WebSocket reconnection endpoint
+app.post('/reconnect', async (req, res) => {
+    if (!authToken || !deviceProxyId) {
+        return res.status(400).json({
+            success: false,
+            error: 'Not authenticated'
+        });
+    }
+    
+    try {
+        const success = await retryWebSocketConnection();
+        res.json({
+            success: success,
+            message: success ? 'WebSocket reconnected successfully' : 'WebSocket reconnection failed - automatic retry active'
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // Отключение от сервера
 app.post('/disconnect', (req, res) => {
+    // Clear reconnection interval
+    if (reconnectInterval) {
+        clearInterval(reconnectInterval);
+        reconnectInterval = null;
+    }
+    
     if (channel) {
         console.log('Leaving channel...');
         channel.leave();
@@ -328,6 +414,17 @@ async function connectToPhoenixChannel() {
         throw new Error('Device ID is missing');
     }
     
+    // Disconnect existing connection if any
+    if (channel) {
+        channel.leave();
+        channel = null;
+    }
+    
+    if (socket) {
+        socket.disconnect();
+        socket = null;
+    }
+    
     try {
         console.log('Connecting to Phoenix Channel...');
         console.log(`Device ID: ${deviceProxyId}`);
@@ -356,6 +453,10 @@ async function connectToPhoenixChannel() {
         
         socket.onClose(() => {
             console.log('Phoenix socket disconnected');
+            // Start auto-reconnect if we have valid auth
+            if (authToken && deviceProxyId) {
+                startAutoReconnect();
+            }
         });
         
         socket.onError((error) => {
@@ -520,7 +621,7 @@ function generateTestReceiptHtml() {
             <div>Device ID: ${deviceProxyId || 'Unknown'}</div>
             <div class="line"></div>
             <div class="center">
-                Printer: OK<br>
+                Printer: ${receiptPrinter && receiptPrinter.isReady() ? 'OK' : 'N/A'}<br>
                 Scanner: ${cardScanner && cardScanner.isReady() ? 'OK' : 'N/A'}<br>
                 Connection: ${socket && socket.isConnected() ? 'OK' : 'N/A'}
             </div>
@@ -536,6 +637,10 @@ function generateTestReceiptHtml() {
 // Graceful shutdown
 process.on('SIGINT', () => {
     console.log('Shutting down gracefully...');
+    
+    if (reconnectInterval) {
+        clearInterval(reconnectInterval);
+    }
     
     if (channel) {
         channel.leave();
