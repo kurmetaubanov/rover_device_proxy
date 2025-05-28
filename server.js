@@ -7,7 +7,7 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-let ELIXIR_SERVER_URL = process.env.ELIXIR_SERVER_URL || 'http://localhost:4000';
+let ELIXIR_SERVER_URL = process.env.ELIXIR_SERVER_URL || 'http://localhost:4001';
 
 app.use(express.json());
 app.use(express.static('public'));
