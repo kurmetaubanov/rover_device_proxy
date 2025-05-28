@@ -415,13 +415,8 @@ async function connectToPhoenixChannel() {
     }
     
     // Disconnect existing connection if any
-    if (channel) {
-        channel.leave();
-        channel = null;
-    }
-    
     if (socket) {
-        socket.disconnect();
+        socket.close();
         socket = null;
     }
     
@@ -437,134 +432,88 @@ async function connectToPhoenixChannel() {
         
         console.log('WebSocket URL:', wsUrl);
         
-        // Создаем Phoenix Socket
-        socket = new Socket(wsUrl, {
-            params: { token: authToken },
-            timeout: 10000,
-            logger: (kind, msg, data) => {
-                console.log(`Phoenix ${kind}: ${msg}`, data);
+        // Create raw WebSocket connection
+        socket = new WebSocket(wsUrl);
+        
+        // Connection handlers
+        socket.on('open', () => {
+            console.log('Phoenix socket connected');
+            
+            // Send join message
+            const joinMsg = {
+                topic: `device:${deviceProxyId}`,
+                event: "phx_join",
+                payload: { token: authToken },
+                ref: "join_ref_1"
+            };
+            
+            console.log(`Joining channel: device:${deviceProxyId}`);
+            socket.send(JSON.stringify(joinMsg));
+        });
+        
+        socket.on('message', (data) => {
+            try {
+                const message = JSON.parse(data.toString());
+                console.log('📨 Received message:', JSON.stringify(message, null, 2));
+                
+                if (message.event === 'phx_reply') {
+                    if (message.payload.status === 'ok') {
+                        console.log('✅ Join successful!', message.payload.response);
+                        channel = { connected: true }; // Simple flag
+                    } else {
+                        console.error('❌ Join failed:', message.payload);
+                        throw new Error(`Channel join failed: ${JSON.stringify(message.payload)}`);
+                    }
+                } else if (message.event === 'print_html') {
+                    // Handle print commands
+                    handlePrintCommand(message.payload);
+                }
+            } catch (error) {
+                console.log('Raw message (not JSON):', data.toString());
             }
         });
         
-        // Обработчики состояния подключения
-        socket.onOpen(() => {
-            console.log('Phoenix socket connected');
-        });
-        
-        socket.onClose(() => {
+        socket.on('close', () => {
             console.log('Phoenix socket disconnected');
+            channel = null;
             // Start auto-reconnect if we have valid auth
             if (authToken && deviceProxyId) {
                 startAutoReconnect();
             }
         });
         
-        socket.onError((error) => {
+        socket.on('error', (error) => {
             console.error('Phoenix socket error:', error);
+            throw error;
         });
         
-        // Подключаемся к сокету
-        socket.connect();
-        
-        // Ждем подключения сокета
+        // Wait for connection
         await new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 reject(new Error('Socket connection timeout'));
             }, 10000);
             
-            if (socket.isConnected()) {
+            socket.on('open', () => {
                 clearTimeout(timeout);
                 resolve();
-            } else {
-                socket.onOpen(() => {
-                    clearTimeout(timeout);
-                    resolve();
-                });
-                
-                socket.onError((error) => {
-                    clearTimeout(timeout);
-                    reject(error);
-                });
-            }
-        });
-        
-        console.log('Socket connected, joining channel...');
-        
-        // Присоединяемся к каналу устройства
-        const channelTopic = `device:${deviceProxyId}`;
-        console.log(`Joining channel: ${channelTopic}`);
-        
-        channel = socket.channel(channelTopic, { token: authToken });
-        
-        // Обработчики событий канала
-        channel.on('print_html', async (payload) => {
-            console.log(`Received print command. Print ID: ${payload.print_id}`);
+            });
             
-            if (receiptPrinter && receiptPrinter.isReady()) {
-                try {
-                    await receiptPrinter.printHtml(payload.html, payload.options || {});
-                    
-                    // Уведомляем сервер о успешной печати
-                    channel.push('print_completed', {
-                        print_id: payload.print_id,
-                        status: 'success',
-                        timestamp: new Date().toISOString()
-                    });
-                    
-                    console.log(`Print completed successfully. Print ID: ${payload.print_id}`);
-                } catch (error) {
-                    console.error('Print failed:', error);
-                    
-                    // Уведомляем сервер об ошибке печати
-                    channel.push('print_completed', {
-                        print_id: payload.print_id,
-                        status: 'failed',
-                        error: error.message,
-                        timestamp: new Date().toISOString()
-                    });
-                }
-            } else {
-                console.warn('Print command received but printer not ready');
-                
-                channel.push('print_completed', {
-                    print_id: payload.print_id,
-                    status: 'failed',
-                    error: 'Printer not ready',
-                    timestamp: new Date().toISOString()
-                });
-            }
+            socket.on('error', (error) => {
+                clearTimeout(timeout);
+                reject(error);
+            });
         });
         
-        // Присоединяемся к каналу
-        await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error('Channel join timeout'));
-            }, 10000);
-            
-            channel.join()
-                .receive('ok', (response) => {
-                    clearTimeout(timeout);
-                    console.log('Successfully joined device channel:', response);
-                    resolve(response);
-                })
-                .receive('error', (error) => {
-                    clearTimeout(timeout);
-                    console.error('Failed to join device channel:', error);
-                    reject(new Error(`Channel join failed: ${JSON.stringify(error)}`));
-                })
-                .receive('timeout', () => {
-                    clearTimeout(timeout);
-                    reject(new Error('Channel join timeout'));
-                });
-        });
-        
-        // Отправляем heartbeat каждые 30 секунд
+        // Send heartbeat every 30 seconds
         const heartbeatInterval = setInterval(() => {
-            if (channel && socket && socket.isConnected()) {
-                channel.push('heartbeat', { 
-                    timestamp: Date.now(),
-                    device_id: deviceProxyId 
-                });
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                const heartbeat = {
+                    topic: "phoenix",
+                    event: "heartbeat",
+                    payload: {},
+                    ref: `hb_${Date.now()}`
+                };
+                socket.send(JSON.stringify(heartbeat));
             } else {
                 clearInterval(heartbeatInterval);
             }
@@ -575,20 +524,97 @@ async function connectToPhoenixChannel() {
     } catch (error) {
         console.error('Failed to connect to Phoenix Channel:', error);
         
-        // Очищаем соединения в случае ошибки
-        if (channel) {
-            channel.leave();
-            channel = null;
-        }
-        
         if (socket) {
-            socket.disconnect();
+            socket.close();
             socket = null;
         }
         
         throw error;
     }
 }
+
+// Add this helper function for handling print commands
+async function handlePrintCommand(payload) {
+    console.log(`Received print command. Print ID: ${payload.print_id}`);
+    
+    if (receiptPrinter && receiptPrinter.isReady()) {
+        try {
+            await receiptPrinter.printHtml(payload.html, payload.options || {});
+            
+            // Send print completed message
+            const completedMsg = {
+                topic: `device:${deviceProxyId}`,
+                event: "print_completed",
+                payload: {
+                    print_id: payload.print_id,
+                    status: 'success',
+                    timestamp: new Date().toISOString()
+                },
+                ref: `print_${Date.now()}`
+            };
+            socket.send(JSON.stringify(completedMsg));
+            
+            console.log(`Print completed successfully. Print ID: ${payload.print_id}`);
+        } catch (error) {
+            console.error('Print failed:', error);
+            
+            // Send print failed message
+            const failedMsg = {
+                topic: `device:${deviceProxyId}`,
+                event: "print_completed",
+                payload: {
+                    print_id: payload.print_id,
+                    status: 'failed',
+                    error: error.message,
+                    timestamp: new Date().toISOString()
+                },
+                ref: `print_${Date.now()}`
+            };
+            socket.send(JSON.stringify(failedMsg));
+        }
+    } else {
+        console.warn('Print command received but printer not ready');
+        
+        const failedMsg = {
+            topic: `device:${deviceProxyId}`,
+            event: "print_completed",
+            payload: {
+                print_id: payload.print_id,
+                status: 'failed',
+                error: 'Printer not ready',
+                timestamp: new Date().toISOString()
+            },
+            ref: `print_${Date.now()}`
+        };
+        socket.send(JSON.stringify(failedMsg));
+    }
+}
+
+// Also update the status endpoint to check WebSocket state correctly
+app.get('/status', async (req, res) => {
+    const status = {
+        authenticated: !!authToken,
+        connected: socket ? socket.readyState === WebSocket.OPEN : false,
+        device_id: deviceProxyId,
+        device_name: deviceName,
+        auth_token: authToken ? 'present' : 'missing',
+        printer: {
+            available: !!receiptPrinter,
+            ready: receiptPrinter ? receiptPrinter.isReady() : false,
+            status: receiptPrinter ? receiptPrinter.getStatus() : 'not_initialized'
+        },
+        scanner: {
+            available: !!cardScanner,
+            ready: cardScanner ? cardScanner.isReady() : false,
+            status: cardScanner ? cardScanner.getStatus() : 'not_initialized'
+        },
+        server_url: ELIXIR_SERVER_URL,
+        auto_connected: process.env.AUTH_TOKEN ? true : false,
+        auto_reconnect_active: !!reconnectInterval
+    };
+    
+    res.json(status);
+});
 
 // Генерация тестового чека
 function generateTestReceiptHtml() {
