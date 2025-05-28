@@ -1,19 +1,20 @@
 const express = require('express');
 const axios = require('axios');
-const io = require('socket.io-client');
+const { Socket } = require('phoenix');
 const ReceiptPrinter = require('./devices/receipt-printer');
 const CardScanner = require('./devices/card-scanner');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const ELIXIR_SERVER_URL = process.env.ELIXIR_SERVER_URL || 'http://localhost:4001/';
+let ELIXIR_SERVER_URL = process.env.ELIXIR_SERVER_URL || 'http://localhost:4000';
 
 app.use(express.json());
 app.use(express.static('public'));
 
 let authToken = null;
 let socket = null;
+let channel = null;
 let deviceProxyId = null;
 let receiptPrinter = null;
 let cardScanner = null;
@@ -28,9 +29,9 @@ async function initializeDevices() {
         
         // Обработчик сканирования карт
         cardScanner.on('cardScanned', (cardData) => {
-            if (socket && socket.connected) {
+            if (channel && socket && socket.isConnected()) {
                 console.log('Card scanned:', cardData.card_id);
-                socket.emit('card_scanned', { card_data: cardData });
+                channel.push('card_scanned', { card_data: cardData });
             } else {
                 console.warn('Card scanned but not connected to server');
             }
@@ -53,32 +54,46 @@ app.post('/authenticate', async (req, res) => {
         });
     }
     
-    const elixirServerUrl = server_host || ELIXIR_SERVER_URL;
+    const httpServerUrl = server_host || ELIXIR_SERVER_URL;
     
     try {
         console.log(`Attempting authentication with 6-digit code: ${auth_code}`);
-        console.log(`Server: ${elixirServerUrl}`);
+        console.log(`Server: ${httpServerUrl}`);
         
-        const response = await axios.post(`${elixirServerUrl}/api/device-proxy/authenticate`, {
+        const response = await axios.post(`${httpServerUrl}/api/device-proxy/authenticate`, {
             auth_code: auth_code
         });
         
         if (response.data.success) {
+            // Сначала устанавливаем все переменные
             authToken = response.data.token;
             deviceProxyId = response.data.device_id;
-            ELIXIR_SERVER_URL = elixirServerUrl; // Update server URL
+            ELIXIR_SERVER_URL = httpServerUrl;
             
             console.log(`Authentication successful. Device: ${response.data.name} (ID: ${deviceProxyId})`);
+            console.log(`Auth token: ${authToken}`);
             
-            // Подключаемся к WebSocket
-            await connectToWebSocket();
-            
-            res.json({ 
-                success: true, 
-                message: 'Authenticated successfully',
-                device_id: deviceProxyId,
-                device_name: response.data.name
-            });
+            // Теперь подключаемся к Phoenix Channel
+            try {
+                await connectToPhoenixChannel();
+                
+                res.json({ 
+                    success: true, 
+                    message: 'Authenticated successfully',
+                    device_id: deviceProxyId,
+                    device_name: response.data.name
+                });
+            } catch (wsError) {
+                console.error('WebSocket connection failed:', wsError.message);
+                // Очищаем токены если подключение не удалось
+                authToken = null;
+                deviceProxyId = null;
+                
+                res.status(500).json({
+                    success: false,
+                    error: 'Authentication successful but WebSocket connection failed: ' + wsError.message
+                });
+            }
         } else {
             console.log('Authentication failed: Invalid or expired code');
             res.status(401).json({ 
@@ -107,8 +122,9 @@ app.post('/authenticate', async (req, res) => {
 app.get('/status', async (req, res) => {
     const status = {
         authenticated: !!authToken,
-        connected: socket ? socket.connected : false,
+        connected: socket ? socket.isConnected() : false,
         device_id: deviceProxyId,
+        auth_token: authToken ? 'present' : 'missing',
         printer: {
             available: !!receiptPrinter,
             ready: receiptPrinter ? receiptPrinter.isReady() : false,
@@ -127,7 +143,14 @@ app.get('/status', async (req, res) => {
 
 // Отключение от сервера
 app.post('/disconnect', (req, res) => {
+    if (channel) {
+        console.log('Leaving channel...');
+        channel.leave();
+        channel = null;
+    }
+    
     if (socket) {
+        console.log('Disconnecting socket...');
         socket.disconnect();
         socket = null;
     }
@@ -165,54 +188,106 @@ app.post('/test-print', async (req, res) => {
     }
 });
 
-// Подключение к WebSocket серверу
-async function connectToWebSocket() {
+// Подключение к Phoenix Channel
+async function connectToPhoenixChannel() {
+    // Проверяем наличие токена и ID устройства
     if (!authToken) {
-        throw new Error('No auth token available');
+        throw new Error('Auth token is missing');
+    }
+    
+    if (!deviceProxyId) {
+        throw new Error('Device ID is missing');
     }
     
     try {
-        console.log('Connecting to WebSocket...');
+        console.log('Connecting to Phoenix Channel...');
+        console.log(`Device ID: ${deviceProxyId}`);
+        console.log(`Auth token: ${authToken.substring(0, 10)}...`);
         
-        socket = io(ELIXIR_SERVER_URL, {
-            timeout: 5000,
-            transports: ['websocket', 'polling']
+        // Конвертируем HTTP URL в WebSocket URL для Phoenix
+        const wsUrl = ELIXIR_SERVER_URL
+            .replace('http://', 'ws://')
+            .replace('https://', 'wss://') + '/socket';
+        
+        console.log('WebSocket URL:', wsUrl);
+        
+        // Создаем Phoenix Socket
+        socket = new Socket(wsUrl, {
+            params: { token: authToken },
+            timeout: 10000,
+            logger: (kind, msg, data) => {
+                console.log(`Phoenix ${kind}: ${msg}`, data);
+            }
         });
+        
+        // Обработчики состояния подключения
+        socket.onOpen(() => {
+            console.log('Phoenix socket connected');
+        });
+        
+        socket.onClose(() => {
+            console.log('Phoenix socket disconnected');
+        });
+        
+        socket.onError((error) => {
+            console.error('Phoenix socket error:', error);
+        });
+        
+        // Подключаемся к сокету
+        socket.connect();
+        
+        // Ждем подключения сокета
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('Socket connection timeout'));
+            }, 10000);
+            
+            if (socket.isConnected()) {
+                clearTimeout(timeout);
+                resolve();
+            } else {
+                socket.onOpen(() => {
+                    clearTimeout(timeout);
+                    resolve();
+                });
+                
+                socket.onError((error) => {
+                    clearTimeout(timeout);
+                    reject(error);
+                });
+            }
+        });
+        
+        console.log('Socket connected, joining channel...');
         
         // Присоединяемся к каналу устройства
-        socket.emit('phx_join', {
-            topic: `device:${authToken}`,
-            event: 'phx_join',
-            payload: {},
-            ref: Date.now()
-        });
+        const channelTopic = `device:${deviceProxyId}`;
+        console.log(`Joining channel: ${channelTopic}`);
         
-        socket.on('connect', () => {
-            console.log('Connected to Elixir server via WebSocket');
-        });
+        channel = socket.channel(channelTopic, { token: authToken });
         
-        // Получение команды печати от сервера
-        socket.on('print_html', async (data) => {
-            console.log(`Received print command. Print ID: ${data.print_id}`);
+        // Обработчики событий канала
+        channel.on('print_html', async (payload) => {
+            console.log(`Received print command. Print ID: ${payload.print_id}`);
             
             if (receiptPrinter && receiptPrinter.isReady()) {
                 try {
-                    await receiptPrinter.printHtml(data.html, data.options || {});
+                    await receiptPrinter.printHtml(payload.html, payload.options || {});
                     
                     // Уведомляем сервер о успешной печати
-                    socket.emit('print_completed', {
-                        print_id: data.print_id,
+                    channel.push('print_completed', {
+                        print_id: payload.print_id,
                         status: 'success',
                         timestamp: new Date().toISOString()
                     });
                     
-                    console.log(`Print completed successfully. Print ID: ${data.print_id}`);
+                    console.log(`Print completed successfully. Print ID: ${payload.print_id}`);
                 } catch (error) {
                     console.error('Print failed:', error);
                     
                     // Уведомляем сервер об ошибке печати
-                    socket.emit('print_completed', {
-                        print_id: data.print_id,
+                    channel.push('print_completed', {
+                        print_id: payload.print_id,
                         status: 'failed',
                         error: error.message,
                         timestamp: new Date().toISOString()
@@ -221,8 +296,8 @@ async function connectToWebSocket() {
             } else {
                 console.warn('Print command received but printer not ready');
                 
-                socket.emit('print_completed', {
-                    print_id: data.print_id,
+                channel.push('print_completed', {
+                    print_id: payload.print_id,
                     status: 'failed',
                     error: 'Printer not ready',
                     timestamp: new Date().toISOString()
@@ -230,41 +305,57 @@ async function connectToWebSocket() {
             }
         });
         
-        socket.on('disconnect', (reason) => {
-            console.log('Disconnected from Elixir server:', reason);
+        // Присоединяемся к каналу
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('Channel join timeout'));
+            }, 10000);
+            
+            channel.join()
+                .receive('ok', (response) => {
+                    clearTimeout(timeout);
+                    console.log('Successfully joined device channel:', response);
+                    resolve(response);
+                })
+                .receive('error', (error) => {
+                    clearTimeout(timeout);
+                    console.error('Failed to join device channel:', error);
+                    reject(new Error(`Channel join failed: ${JSON.stringify(error)}`));
+                })
+                .receive('timeout', () => {
+                    clearTimeout(timeout);
+                    reject(new Error('Channel join timeout'));
+                });
         });
         
-        socket.on('connect_error', (error) => {
-            console.error('WebSocket connection error:', error.message);
-        });
-        
-        // Пинг для поддержания соединения
-        const pingInterval = setInterval(() => {
-            if (socket && socket.connected) {
-                socket.emit('ping', { timestamp: Date.now() });
+        // Отправляем heartbeat каждые 30 секунд
+        const heartbeatInterval = setInterval(() => {
+            if (channel && socket && socket.isConnected()) {
+                channel.push('heartbeat', { 
+                    timestamp: Date.now(),
+                    device_id: deviceProxyId 
+                });
             } else {
-                clearInterval(pingInterval);
+                clearInterval(heartbeatInterval);
             }
         }, 30000);
         
-        return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error('WebSocket connection timeout'));
-            }, 5000);
-            
-            socket.on('connect', () => {
-                clearTimeout(timeout);
-                resolve();
-            });
-            
-            socket.on('connect_error', (error) => {
-                clearTimeout(timeout);
-                reject(error);
-            });
-        });
+        console.log('Phoenix Channel connection established successfully');
         
     } catch (error) {
-        console.error('Failed to connect to WebSocket:', error);
+        console.error('Failed to connect to Phoenix Channel:', error);
+        
+        // Очищаем соединения в случае ошибки
+        if (channel) {
+            channel.leave();
+            channel = null;
+        }
+        
+        if (socket) {
+            socket.disconnect();
+            socket = null;
+        }
+        
         throw error;
     }
 }
@@ -301,7 +392,7 @@ function generateTestReceiptHtml() {
             <div class="center">
                 Printer: OK<br>
                 Scanner: ${cardScanner && cardScanner.isReady() ? 'OK' : 'N/A'}<br>
-                Connection: ${socket && socket.connected ? 'OK' : 'N/A'}
+                Connection: ${socket && socket.isConnected() ? 'OK' : 'N/A'}
             </div>
             <div class="line"></div>
             <div class="center">
@@ -315,6 +406,10 @@ function generateTestReceiptHtml() {
 // Graceful shutdown
 process.on('SIGINT', () => {
     console.log('Shutting down gracefully...');
+    
+    if (channel) {
+        channel.leave();
+    }
     
     if (socket) {
         socket.disconnect();
@@ -335,7 +430,7 @@ process.on('SIGINT', () => {
 initializeDevices().then(() => {
     app.listen(PORT, () => {
         console.log(`Device Proxy Server running on http://localhost:${PORT}`);
-        console.log(`Connecting to Elixir server at: ${ELIXIR_SERVER_URL}`);
+        console.log(`Will connect to Phoenix server at: ${ELIXIR_SERVER_URL}`);
         console.log('Waiting for authentication...');
     });
 }).catch(error => {
