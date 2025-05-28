@@ -47,6 +47,8 @@ function updateEnvFile(updates) {
         
         // Apply updates
         Object.assign(envVars, updates);
+
+        console.log(updates);
         
         // Rebuild .env content
         const newContent = [
@@ -61,6 +63,8 @@ function updateEnvFile(updates) {
             `SERVER_HOST=${envVars.SERVER_HOST || ''}`,
             ''
         ].join('\n');
+
+        console.log(newContent);
         
         fs.writeFileSync(envPath, newContent);
         console.log('Updated .env file with authentication data');
@@ -169,6 +173,7 @@ app.post('/authenticate', async (req, res) => {
             
             console.log(`Authentication successful. Device: ${deviceName} (ID: ${deviceProxyId})`);
             
+            console.log(authToken);
             // Save to .env file
             updateEnvFile({
                 AUTH_TOKEN: authToken,
