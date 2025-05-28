@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Device Proxy Control</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Device Proxy Server</h1>
+            <div class="status" id="connection-status">
+                <span class="dot disconnected"></span>
+                <span>Disconnected</span>
+            </div>
+        </header>
+        
+        <div id="auth-section" class="section">
+            <h2>Server Connection</h2>
+            <div class="form-group">
+                <label for="server-host">Elixir Server Host:</label>
+                <input type="text" id="server-host" placeholder="http://localhost:4000" value="http://localhost:4000">
+            </div>
+            <div class="form-group">
+                <label for="auth-code">6-Digit Authorization Code:</label>
+                <input type="text" id="auth-code" placeholder="000000" maxlength="6" pattern="[0-9]{6}">
+                <small>Enter the 6-digit code from admin panel</small>
+            </div>
+            <button id="connect-btn" onclick="authenticate()">Connect to Server</button>
+            <div id="auth-status"></div>
+        </div>
+        
+        <div id="device-section" class="section" style="display: none;">
+            <h2>Device Status</h2>
+            <div id="device-info">
+                <p><strong>Device:</strong> <span id="device-name">-</span></p>
+                <p><strong>Device ID:</strong> <span id="device-id">-</span></p>
+            </div>
+            
+            <div class="device-grid">
+                <div class="device-card">
+                    <h3>Receipt Printer</h3>
+                    <div class="device-status">
+                        <span class="dot" id="printer-dot"></span>
+                        <span id="printer-status">Not Ready</span>
+                    </div>
+                    <button id="test-print-btn" onclick="testPrint()" disabled>Test Print</button>
+                </div>
+                
+                <div class="device-card">
+                    <h3>Card Scanner</h3>
+                    <div class="device-status">
+                        <span class="dot" id="scanner-dot"></span>
+                        <span id="scanner-status">Not Ready</span>
+                    </div>
+                    <div id="last-scan"></div>
+                </div>
+            </div>
+            
+            <div class="controls">
+                <button id="disconnect-btn" onclick="disconnect()">Disconnect</button>
+                <button id="refresh-btn" onclick="refreshStatus()">Refresh Status</button>
+            </div>
+        </div>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>

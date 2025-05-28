@@ -7,7 +7,7 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const ELIXIR_SERVER_URL = process.env.ELIXIR_SERVER_URL || 'http://localhost:4000';
+const ELIXIR_SERVER_URL = process.env.ELIXIR_SERVER_URL || 'http://localhost:4001';
 
 app.use(express.json());
 app.use(express.static('public'));
@@ -42,29 +42,33 @@ async function initializeDevices() {
     }
 }
 
-// Аутентификация с Elixir сервером
+// Аутентификация с Elixir сервером по 6-значному коду
 app.post('/authenticate', async (req, res) => {
-    const { code } = req.body;
+    const { auth_code, server_host } = req.body;
     
-    if (!code || code.length !== 6) {
+    if (!auth_code || auth_code.length !== 6) {
         return res.status(400).json({ 
             success: false, 
-            error: 'Code must be 6 characters long' 
+            error: 'Authorization code must be 6 digits long' 
         });
     }
     
+    const elixirServerUrl = server_host || ELIXIR_SERVER_URL;
+    
     try {
-        console.log(`Attempting authentication with code: ${code}`);
+        console.log(`Attempting authentication with 6-digit code: ${auth_code}`);
+        console.log(`Server: ${elixirServerUrl}`);
         
-        const response = await axios.post(`${ELIXIR_SERVER_URL}/api/device-proxy/authenticate`, {
-            code: code
+        const response = await axios.post(`${elixirServerUrl}/api/device-proxy/authenticate`, {
+            auth_code: auth_code
         });
         
         if (response.data.success) {
             authToken = response.data.token;
             deviceProxyId = response.data.device_id;
+            ELIXIR_SERVER_URL = elixirServerUrl; // Update server URL
             
-            console.log(`Authentication successful. Device ID: ${deviceProxyId}`);
+            console.log(`Authentication successful. Device: ${response.data.name} (ID: ${deviceProxyId})`);
             
             // Подключаемся к WebSocket
             await connectToWebSocket();
@@ -72,13 +76,14 @@ app.post('/authenticate', async (req, res) => {
             res.json({ 
                 success: true, 
                 message: 'Authenticated successfully',
-                device_id: deviceProxyId
+                device_id: deviceProxyId,
+                device_name: response.data.name
             });
         } else {
-            console.log('Authentication failed: Invalid code');
+            console.log('Authentication failed: Invalid or expired code');
             res.status(401).json({ 
                 success: false, 
-                error: 'Invalid code' 
+                error: 'Invalid or expired authorization code' 
             });
         }
     } catch (error) {
