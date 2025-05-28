@@ -433,7 +433,7 @@ async function connectToPhoenixChannel() {
         // Конвертируем HTTP URL в WebSocket URL для Phoenix
         const wsUrl = ELIXIR_SERVER_URL
             .replace('http://', 'ws://')
-            .replace('https://', 'wss://') + '/socket';
+            .replace('https://', 'wss://') + '/socket/websocket';
         
         console.log('WebSocket URL:', wsUrl);
         
