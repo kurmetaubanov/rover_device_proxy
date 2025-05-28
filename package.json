@@ -1,0 +1,24 @@
+{
+  "name": "device-proxy",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.9.0",
+    "escpos": "^3.0.0-alpha.6",
+    "escpos-usb": "^3.0.0-alpha.4",
+    "express": "^5.1.0",
+    "node-hid": "^3.1.2",
+    "puppeteer": "^24.9.0",
+    "socket.io-client": "^4.8.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
