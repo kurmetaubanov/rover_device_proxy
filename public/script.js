@@ -85,6 +85,12 @@ async function authenticate() {
     }
 }
 
+async function printTest() {
+    console.log('printTest');
+
+    await fetch('/print-test');
+}
+
 function showDeviceSection() {
     document.getElementById('auth-section').style.display = 'none';
     document.getElementById('device-section').style.display = 'block';

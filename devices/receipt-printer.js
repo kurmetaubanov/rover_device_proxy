@@ -1,5 +1,5 @@
 const escpos = require('escpos');
-escpos.USB = require('escpos-usb');
+escpos.USB = require('../vendor/escpos-usb');
 const puppeteer = require('puppeteer');
 
 class ReceiptPrinter {
@@ -18,6 +18,8 @@ class ReceiptPrinter {
             // Попытка подключения к USB принтеру
             const devices = escpos.USB.findPrinter();
             
+            console.log('devices', devices);
+
             if (devices.length > 0) {
                 this.device = new escpos.USB();
                 this.printer = new escpos.Printer(this.device);
@@ -81,7 +83,7 @@ class ReceiptPrinter {
             
             // Устанавливаем размер для чековой ленты (58мм ≈ 220px при 96 DPI)
             await page.setViewport({ 
-                width: 220,
+                width: 303,
                 height: 600,
                 deviceScaleFactor: 2 // Для лучшего качества печати
             });
@@ -97,7 +99,7 @@ class ReceiptPrinter {
             
             // Обновляем viewport под реальную высоту
             await page.setViewport({ 
-                width: 220,
+                width: 303,
                 height: Math.max(bodyHeight, 100),
                 deviceScaleFactor: 2
             });
@@ -127,15 +129,19 @@ class ReceiptPrinter {
                     }
                     
                     try {
-                        this.printer
+                        escpos.Image.load(imageBuffer, "image/png", image => {
+                            console.log('image', image);
+                            return this.printer
                             .font('a')
                             .align('ct')
                             .size(0, 0)
-                            .raster(escpos.Image.load(imageBuffer))
+                            .raster(image)
                             .cut()
                             .close(() => {
                                 resolve();
-                            });
+                            });;
+                        })
+                        
                     } catch (printError) {
                         reject(printError);
                     }
