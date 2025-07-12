@@ -16,6 +16,7 @@
     "dotenv": "^16.5.0",
     "escpos": "^3.0.0-alpha.6",
     "escpos-usb": "^3.0.0-alpha.4",
+    "escpos-network": "^3.0.0-alpha.5",
     "express": "^5.1.0",
     "node-hid": "^3.1.2",
     "puppeteer": "^24.9.0",
