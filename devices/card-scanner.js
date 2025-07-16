@@ -22,7 +22,7 @@ class CardScanner extends EventEmitter {
       // Ищем устройство сканера карт
       // Замените vendorId и productId на реальные значения вашего сканера
       const scannerDevice = devices.find(
-        (d) => d.vendorId === 0x08ff && d.productId === 0x0009 // Пример для некоторых считывателей карт
+        (d) => d.vendorId === 0x5131 && d.productId === 0x2007 // Пример для некоторых считывателей карт
       );
 
       if (scannerDevice) {
